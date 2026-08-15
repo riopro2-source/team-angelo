@@ -392,6 +392,7 @@
     <div class="status-banner" id="statusBanner"></div>
 
     <button class="btn-amber btn-block" id="joinBtn">Join queue</button>
+    <button class="btn-amber btn-block" id="chargingBtn" style="display:none;">Charging</button>
     <button class="btn-mint btn-block" id="doneBtn" style="display:none;">I'm done charging</button>
     <button class="btn-ghost btn-block" id="leaveBtn" style="display:none;">Leave queue</button>
 
@@ -450,6 +451,7 @@ let adminUnlocked = false;
 let myIdentity = null;
 let audioCtx = null;
 let alarmInterval = null;
+let speechInterval = null;
 let notifiedThisTurn = false;
 
 function genId(){
@@ -506,7 +508,14 @@ function ensureAudio(){
   if(audioCtx && audioCtx.state === 'suspended'){ audioCtx.resume(); }
 }
 
+function vibrate(pattern){
+  try{
+    if('vibrate' in navigator){ navigator.vibrate(pattern); }
+  }catch(e){}
+}
+
 function beep(){
+  vibrate([250, 100, 250]);
   if(!audioCtx) return;
   const now = audioCtx.currentTime;
   const osc = audioCtx.createOscillator();
@@ -522,18 +531,38 @@ function beep(){
   osc.stop(now + 0.3);
 }
 
+function speakYouAreNext(){
+  if(!('speechSynthesis' in window)) return;
+  try{
+    window.speechSynthesis.cancel();
+    const utter = new SpeechSynthesisUtterance('You are next. Please plug in, then tap Charging.');
+    utter.rate = 1;
+    utter.pitch = 1;
+    utter.volume = 1;
+    window.speechSynthesis.speak(utter);
+  }catch(e){ console.error('Speech failed', e); }
+}
+
 function startAlarm(){
   if(alarmInterval) return;
   ensureAudio();
   beep();
+  vibrate([300, 100, 300, 100, 300]);
+  speakYouAreNext();
   alarmInterval = setInterval(beep, 1200);
+  speechInterval = setInterval(speakYouAreNext, 30000);
   if('Notification' in window && Notification.permission === 'granted'){
-    try{ new Notification("It's your turn to charge"); }catch(e){}
+    try{ new Notification("You're next — it's your turn to charge", { vibrate: [300, 100, 300, 100, 300] }); }catch(e){}
   }
 }
 
 function stopAlarm(){
   if(alarmInterval){ clearInterval(alarmInterval); alarmInterval = null; }
+  if(speechInterval){ clearInterval(speechInterval); speechInterval = null; }
+  if('speechSynthesis' in window){
+    try{ window.speechSynthesis.cancel(); }catch(e){}
+  }
+  vibrate(0);
 }
 
 function getDeviceId(){
@@ -605,6 +634,7 @@ function render(record){
   const board = document.getElementById('board');
   const statusBanner = document.getElementById('statusBanner');
   const joinBtn = document.getElementById('joinBtn');
+  const chargingBtn = document.getElementById('chargingBtn');
   const doneBtn = document.getElementById('doneBtn');
   const leaveBtn = document.getElementById('leaveBtn');
   const queueList = document.getElementById('queueList');
@@ -613,11 +643,12 @@ function render(record){
   const current = queue.length > 0 ? queue[0] : null;
   const myIndex = queue.findIndex(p => p.id === myIdentity.id);
   const iAmCurrent = current && current.id === myIdentity.id;
+  const iHaveConfirmed = iAmCurrent && !!current.turnStartedAt;
 
   if(current){
     boardName.textContent = current.name;
     boardName.classList.remove('empty');
-    boardSub.textContent = iAmCurrent ? "That's you" : '';
+    boardSub.textContent = iAmCurrent ? (iHaveConfirmed ? "That's you — charging" : "That's you — tap Charging below") : '';
   } else {
     boardName.textContent = 'Nobody in line';
     boardName.classList.add('empty');
@@ -627,16 +658,20 @@ function render(record){
   board.classList.toggle('my-turn', !!iAmCurrent);
 
   statusBanner.classList.remove('show','turn','waiting');
-  if(iAmCurrent){
+  if(iAmCurrent && !iHaveConfirmed){
     statusBanner.classList.add('show','turn');
-    statusBanner.textContent = "It's your turn — plug in, then tap done when you're finished.";
+    statusBanner.textContent = "It's your turn — plug in, then tap Charging to confirm and silence the alarm.";
+  } else if(iAmCurrent && iHaveConfirmed){
+    statusBanner.classList.add('show','turn');
+    statusBanner.textContent = "You're charging. Tap done when you're finished.";
   } else if(myIndex > 0){
     statusBanner.classList.add('show','waiting');
     statusBanner.textContent = `You're #${myIndex + 1} in line. You'll get an alarm when it's your turn.`;
   }
 
   joinBtn.style.display = myIndex === -1 ? 'block' : 'none';
-  doneBtn.style.display = iAmCurrent ? 'block' : 'none';
+  chargingBtn.style.display = (iAmCurrent && !iHaveConfirmed) ? 'block' : 'none';
+  doneBtn.style.display = iHaveConfirmed ? 'block' : 'none';
   leaveBtn.style.display = (myIndex > 0) ? 'block' : 'none';
 
   const rest = queue.slice(1);
@@ -658,7 +693,7 @@ function render(record){
 
   document.getElementById('whoAmI').textContent = myIdentity.name;
 
-  if(iAmCurrent){
+  if(iAmCurrent && !iHaveConfirmed){
     if(!notifiedThisTurn){ notifiedThisTurn = true; startAlarm(); }
   } else {
     notifiedThisTurn = false;
@@ -669,10 +704,6 @@ function render(record){
 async function refresh(){
   document.getElementById('setupBanner').classList.toggle('show', !cloudReady());
   const record = await cloudRead();
-  if(record.queue.length && !record.queue[0].turnStartedAt){
-    record.queue[0].turnStartedAt = Date.now();
-    await cloudWrite(record);
-  }
   render(record);
   await renderQr(record.link);
   if(adminMode){ renderAdminPanel(record); }
@@ -719,6 +750,17 @@ function buildSessionEntry(person){
     duration: Math.max(0, finishedAt - startedAt),
     date: dateKey(finishedAt)
   };
+}
+
+async function markCharging(){
+  const record = await cloudRead();
+  if(record.queue.length && record.queue[0].id === myIdentity.id && !record.queue[0].turnStartedAt){
+    record.queue[0].turnStartedAt = Date.now();
+    await cloudWrite(record);
+  }
+  stopAlarm();
+  notifiedThisTurn = false;
+  await refresh();
 }
 
 async function markDone(){
@@ -861,6 +903,7 @@ document.getElementById('nameInput').addEventListener('keydown', (e) => {
 });
 
 document.getElementById('joinBtn').addEventListener('click', joinQueue);
+document.getElementById('chargingBtn').addEventListener('click', markCharging);
 document.getElementById('doneBtn').addEventListener('click', markDone);
 document.getElementById('leaveBtn').addEventListener('click', leaveQueue);
 
