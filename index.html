@@ -104,6 +104,36 @@
   }
   .qr-copy p{font-size:13px; color:var(--text-mute); margin:0;}
 
+  .neighbor-card{
+    background:var(--card);
+    border:1px solid var(--card-line);
+    border-radius:14px;
+    padding:18px 20px;
+    margin-bottom:22px;
+  }
+  .neighbor-row{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    padding:10px 0;
+  }
+  .neighbor-row + .neighbor-row{border-top:1px solid var(--card-line);}
+  .neighbor-label{
+    font-family:'JetBrains Mono',monospace;
+    font-size:11px;
+    letter-spacing:.1em;
+    text-transform:uppercase;
+    color:var(--text-mute);
+  }
+  .neighbor-plate{
+    font-family:'JetBrains Mono',monospace;
+    font-weight:700;
+    font-size:15px;
+    letter-spacing:.03em;
+    color:var(--text);
+  }
+  .neighbor-plate.muted{color:var(--text-mute); font-weight:500; font-size:13px;}
+
   .board{
     background:var(--card);
     border:1px solid var(--card-line);
@@ -360,12 +390,23 @@
     Open <strong>Admin login</strong> below (PIN <code>2468</code>) and fill in the JSONBin settings to finish setup.
   </div>
 
-  <div class="qr-card">
+  <div class="qr-card" id="qrCard">
     <div class="qr-box" id="qrBox"></div>
     <div class="qr-copy">
       <div class="qr-title">Scan to join</div>
       <p>Point your phone's camera here to open this queue and sign up with your plate number.</p>
       <p id="qrLinkNote" style="margin-top:8px; font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--danger); display:none;">No public link set yet — ask your admin to set one in Admin tools.</p>
+    </div>
+  </div>
+
+  <div class="neighbor-card" id="neighborCard" style="display:none;">
+    <div class="neighbor-row">
+      <span class="neighbor-label">Ahead of you</span>
+      <span class="neighbor-plate" id="neighborAhead">—</span>
+    </div>
+    <div class="neighbor-row">
+      <span class="neighbor-label">Behind you</span>
+      <span class="neighbor-plate" id="neighborBehind">—</span>
     </div>
   </div>
 
@@ -683,6 +724,35 @@ function render(record){
   }
 
   joinBtn.style.display = myIndex === -1 ? 'block' : 'none';
+
+  const qrCard = document.getElementById('qrCard');
+  const neighborCard = document.getElementById('neighborCard');
+  if(queue.length === 0){
+    qrCard.style.display = 'flex';
+    neighborCard.style.display = 'none';
+  } else if(myIndex !== -1){
+    qrCard.style.display = 'none';
+    neighborCard.style.display = 'block';
+    const aheadEl = document.getElementById('neighborAhead');
+    const behindEl = document.getElementById('neighborBehind');
+    if(myIndex === 0){
+      aheadEl.textContent = "You're up";
+      aheadEl.className = 'neighbor-plate muted';
+    } else {
+      aheadEl.textContent = queue[myIndex - 1].name;
+      aheadEl.className = 'neighbor-plate';
+    }
+    if(myIndex === queue.length - 1){
+      behindEl.textContent = 'Nobody yet';
+      behindEl.className = 'neighbor-plate muted';
+    } else {
+      behindEl.textContent = queue[myIndex + 1].name;
+      behindEl.className = 'neighbor-plate';
+    }
+  } else {
+    qrCard.style.display = 'none';
+    neighborCard.style.display = 'none';
+  }
   chargingBtn.style.display = (iAmCurrent && !iHaveConfirmed) ? 'block' : 'none';
   doneBtn.style.display = iHaveConfirmed ? 'block' : 'none';
   leaveBtn.style.display = (myIndex > 0) ? 'block' : 'none';
@@ -759,24 +829,19 @@ async function refresh(){
 
   if(record.queue.length){
     const head = record.queue[0];
-    if(!head.turnStartedAt){
-      if(!head.turnAlertedAt){
-        head.turnAlertedAt = Date.now();
-        await cloudWrite(record);
-      } else if(Date.now() - head.turnAlertedAt > CHARGING_CONFIRM_TIMEOUT_MS){
-        record.history.push({
-          id: 'h_' + genId(),
-          plate: head.name,
-          startedAt: head.turnAlertedAt,
-          finishedAt: Date.now(),
-          duration: 0,
-          date: dateKey(Date.now()),
-          skipped: true
-        });
-        record.queue.shift();
-        await cloudWrite(record);
-        record = await cloudRead();
-      }
+    if(!head.turnStartedAt && head.turnAlertedAt && (Date.now() - head.turnAlertedAt > CHARGING_CONFIRM_TIMEOUT_MS)){
+      record.history.push({
+        id: 'h_' + genId(),
+        plate: head.name,
+        startedAt: head.turnAlertedAt,
+        finishedAt: Date.now(),
+        duration: 0,
+        date: dateKey(Date.now()),
+        skipped: true
+      });
+      record.queue.shift();
+      await cloudWrite(record);
+      record = await cloudRead();
     }
   }
 
@@ -890,6 +955,7 @@ async function markDone(){
   if(record.queue.length && record.queue[0].deviceId === myDeviceId){
     record.history.push(buildSessionEntry(record.queue[0]));
     record.queue.shift();
+    if(record.queue.length){ record.queue[0].turnAlertedAt = Date.now(); }
     await cloudWrite(record);
   }
   await refresh();
@@ -897,7 +963,9 @@ async function markDone(){
 
 async function leaveQueue(){
   const record = await cloudRead();
+  const wasCurrent = record.queue.length && record.queue[0].deviceId === myDeviceId;
   record.queue = record.queue.filter(p => p.deviceId !== myDeviceId);
+  if(wasCurrent && record.queue.length){ record.queue[0].turnAlertedAt = Date.now(); }
   await cloudWrite(record);
   await refresh();
 }
@@ -916,6 +984,7 @@ async function adminMarkCurrentDone(){
   if(record.queue.length){
     record.history.push(buildSessionEntry(record.queue[0]));
     record.queue.shift();
+    if(record.queue.length){ record.queue[0].turnAlertedAt = Date.now(); }
     await cloudWrite(record);
   }
   await refresh();
@@ -923,7 +992,9 @@ async function adminMarkCurrentDone(){
 
 async function adminRemove(id){
   const record = await cloudRead();
+  const wasCurrent = record.queue.length && record.queue[0].id === id;
   record.queue = record.queue.filter(p => p.id !== id);
+  if(wasCurrent && record.queue.length){ record.queue[0].turnAlertedAt = Date.now(); }
   await cloudWrite(record);
   await refresh();
 }
