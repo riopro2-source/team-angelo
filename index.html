@@ -390,6 +390,7 @@
     </div>
 
     <div class="status-banner" id="statusBanner"></div>
+    <div id="countdownText" style="display:none; text-align:center; font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--danger); margin-top:8px;"></div>
 
     <button class="btn-amber btn-block" id="joinBtn">Join queue</button>
     <button class="btn-amber btn-block" id="chargingBtn" style="display:none;">Charging</button>
@@ -416,6 +417,13 @@
       <p class="help-text">Paste the real public web address where this app is hosted. This drives the QR code for everyone.</p>
       <input type="text" id="linkInput" placeholder="https://your-hosted-link.example.com/" style="margin-bottom:10px;" />
       <button class="btn-amber btn-block" id="saveLinkBtn" style="margin-bottom:20px;">Save link</button>
+
+      <h3>Depot location lock</h3>
+      <p class="help-text" id="depotStatusText">Not set — drivers can currently join from anywhere.</p>
+      <p class="help-text">Stand physically at the charging depot, then tap the button below. This saves your current GPS position as the depot location — drivers will only be able to join the queue when their phone is within range of it.</p>
+      <input type="text" id="radiusInput" placeholder="Allowed distance in meters (default 150)" style="margin-bottom:10px;" />
+      <button class="btn-amber btn-block" id="setDepotBtn" style="margin-bottom:10px;">Use my current location as the depot</button>
+      <button class="btn-ghost btn-block" id="clearDepotBtn" style="margin-bottom:20px;">Remove location lock</button>
 
       <h3>Today</h3>
       <div class="stat-grid">
@@ -463,7 +471,7 @@ function cloudReady(){
 }
 
 async function cloudRead(){
-  if(!cloudReady()) return { queue: [], history: [], link: '' };
+  if(!cloudReady()) return { queue: [], history: [], link: '', depotLat: null, depotLng: null, depotRadius: 150 };
   try{
     const res = await fetch('https://api.jsonbin.io/v3/b/' + CLOUD_BIN_ID + '/latest', {
       headers: { 'X-Master-Key': CLOUD_API_KEY }
@@ -474,11 +482,15 @@ async function cloudRead(){
     return {
       queue: Array.isArray(record.queue) ? record.queue : [],
       history: Array.isArray(record.history) ? record.history : [],
-      link: typeof record.link === 'string' ? record.link : ''
+      link: typeof record.link === 'string' ? record.link : '',
+      plateOwners: (record.plateOwners && typeof record.plateOwners === 'object') ? record.plateOwners : {},
+      depotLat: typeof record.depotLat === 'number' ? record.depotLat : null,
+      depotLng: typeof record.depotLng === 'number' ? record.depotLng : null,
+      depotRadius: typeof record.depotRadius === 'number' ? record.depotRadius : 150
     };
   }catch(e){
     console.error('Cloud read failed', e);
-    return { queue: [], history: [], link: '' };
+    return { queue: [], history: [], link: '', plateOwners: {}, depotLat: null, depotLng: null, depotRadius: 150 };
   }
 }
 
@@ -701,13 +713,97 @@ function render(record){
   }
 }
 
+const CHARGING_CONFIRM_TIMEOUT_MS = 5 * 60 * 1000;
+
+let countdownTickInterval = null;
+let currentTurnAlertedAt = null;
+
+function updateCountdown(record){
+  const el = document.getElementById('countdownText');
+  const current = record.queue.length ? record.queue[0] : null;
+  const iAmCurrent = current && myIdentity && current.id === myIdentity.id;
+  const needsConfirm = iAmCurrent && !current.turnStartedAt && current.turnAlertedAt;
+
+  if(!needsConfirm){
+    el.style.display = 'none';
+    currentTurnAlertedAt = null;
+    if(countdownTickInterval){ clearInterval(countdownTickInterval); countdownTickInterval = null; }
+    return;
+  }
+
+  currentTurnAlertedAt = current.turnAlertedAt;
+  el.style.display = 'block';
+  tickCountdown();
+  if(!countdownTickInterval){
+    countdownTickInterval = setInterval(tickCountdown, 1000);
+  }
+}
+
+function tickCountdown(){
+  const el = document.getElementById('countdownText');
+  if(currentTurnAlertedAt === null) return;
+  const remainingMs = CHARGING_CONFIRM_TIMEOUT_MS - (Date.now() - currentTurnAlertedAt);
+  if(remainingMs <= 0){
+    el.textContent = "Time's up — you're about to be removed from the queue.";
+    return;
+  }
+  const mins = Math.floor(remainingMs / 60000);
+  const secs = Math.floor((remainingMs % 60000) / 1000);
+  el.textContent = 'Tap Charging within ' + mins + ':' + String(secs).padStart(2,'0') + ' or you\'ll be removed from the queue.';
+}
+
 async function refresh(){
   document.getElementById('setupBanner').classList.toggle('show', !cloudReady());
-  const record = await cloudRead();
+  let record = await cloudRead();
+
+  if(record.queue.length){
+    const head = record.queue[0];
+    if(!head.turnStartedAt){
+      if(!head.turnAlertedAt){
+        head.turnAlertedAt = Date.now();
+        await cloudWrite(record);
+      } else if(Date.now() - head.turnAlertedAt > CHARGING_CONFIRM_TIMEOUT_MS){
+        record.history.push({
+          id: 'h_' + genId(),
+          plate: head.name,
+          startedAt: head.turnAlertedAt,
+          finishedAt: Date.now(),
+          duration: 0,
+          date: dateKey(Date.now()),
+          skipped: true
+        });
+        record.queue.shift();
+        await cloudWrite(record);
+        record = await cloudRead();
+      }
+    }
+  }
+
   render(record);
   await renderQr(record.link);
   if(adminMode){ renderAdminPanel(record); }
+  updateCountdown(record);
   return record;
+}
+
+function distanceMeters(lat1, lng1, lat2, lng2){
+  const R = 6371000;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+function getCurrentPosition(){
+  return new Promise((resolve, reject) => {
+    if(!('geolocation' in navigator)){ reject(new Error('no geolocation')); return; }
+    navigator.geolocation.getCurrentPosition(
+      pos => resolve(pos.coords),
+      err => reject(err),
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  });
 }
 
 async function joinQueue(){
@@ -720,6 +816,29 @@ async function joinQueue(){
 
   const alreadyInQueue = record.queue.find(p => p.id === myIdentity.id);
   if(alreadyInQueue) { await refresh(); return; }
+
+  if(record.depotLat !== null && record.depotLng !== null){
+    const joinBtn = document.getElementById('joinBtn');
+    joinBtn.disabled = true;
+    joinBtn.textContent = 'Checking your location…';
+    try{
+      const coords = await getCurrentPosition();
+      const dist = distanceMeters(coords.latitude, coords.longitude, record.depotLat, record.depotLng);
+      if(dist > record.depotRadius){
+        window.alert('You need to be at the charging depot to join the queue. You\'re about ' + Math.round(dist) + 'm away (allowed range: ' + record.depotRadius + 'm).');
+        joinBtn.disabled = false;
+        joinBtn.textContent = 'Join queue';
+        return;
+      }
+    }catch(e){
+      window.alert('This queue requires location access to confirm you\'re at the depot. Please enable location permissions for this site and try again.');
+      joinBtn.disabled = false;
+      joinBtn.textContent = 'Join queue';
+      return;
+    }
+    joinBtn.disabled = false;
+    joinBtn.textContent = 'Join queue';
+  }
 
   const deviceAlreadyQueued = record.queue.find(p => p.deviceId === myDeviceId);
   if(deviceAlreadyQueued){
@@ -923,6 +1042,8 @@ document.getElementById('adminToggleBtn').addEventListener('click', async () => 
     document.getElementById('apiKeyInput').value = CLOUD_API_KEY;
     const record = await cloudRead();
     document.getElementById('linkInput').value = record.link || '';
+    document.getElementById('radiusInput').value = record.depotRadius || 150;
+    updateDepotStatusText(record);
     renderAdminPanel(record);
   }
 });
@@ -951,6 +1072,47 @@ document.getElementById('saveLinkBtn').addEventListener('click', async () => {
 
 document.getElementById('resetQueueBtn').addEventListener('click', adminResetQueue);
 
+function updateDepotStatusText(record){
+  const el = document.getElementById('depotStatusText');
+  if(record.depotLat !== null && record.depotLng !== null){
+    el.textContent = 'Location lock is ON — drivers must be within ' + record.depotRadius + 'm of the saved depot spot to join.';
+    el.style.color = 'var(--mint)';
+  } else {
+    el.textContent = 'Not set — drivers can currently join from anywhere.';
+    el.style.color = 'var(--text-mute)';
+  }
+}
+
+document.getElementById('setDepotBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('setDepotBtn');
+  const radiusVal = parseInt(document.getElementById('radiusInput').value, 10) || 150;
+  btn.disabled = true;
+  btn.textContent = 'Getting your location…';
+  try{
+    const coords = await getCurrentPosition();
+    const record = await cloudRead();
+    record.depotLat = coords.latitude;
+    record.depotLng = coords.longitude;
+    record.depotRadius = radiusVal;
+    await cloudWrite(record);
+    updateDepotStatusText(record);
+    window.alert('Depot location saved. Drivers must now be within ' + radiusVal + 'm of this spot to join the queue.');
+  }catch(e){
+    window.alert('Could not get your location. Make sure location permissions are enabled for this site and try again.');
+  }
+  btn.disabled = false;
+  btn.textContent = 'Use my current location as the depot';
+});
+
+document.getElementById('clearDepotBtn').addEventListener('click', async () => {
+  if(!window.confirm('Remove the location lock? Drivers will be able to join from anywhere again.')) return;
+  const record = await cloudRead();
+  record.depotLat = null;
+  record.depotLng = null;
+  await cloudWrite(record);
+  updateDepotStatusText(record);
+});
+
 document.getElementById('resetIdentity').addEventListener('click', () => {
   stopAlarm();
   clearIdentity();
@@ -963,4 +1125,3 @@ init();
 </script>
 </body>
 </html>
-
