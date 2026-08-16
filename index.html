@@ -547,9 +547,10 @@ function speakYouAreNext(){
   if(!('speechSynthesis' in window)) return;
   try{
     window.speechSynthesis.cancel();
-    const utter = new SpeechSynthesisUtterance('You are next. Please plug in, then tap Charging.');
-    utter.rate = 1;
-    utter.pitch = 1;
+    const utter = new SpeechSynthesisUtterance('IKAW NA MAG CHARGE! PAGDALI! Pislita ang charging button ug naka saksak na ang charger.');
+    utter.lang = 'fil-PH';
+    utter.rate = 1.15;
+    utter.pitch = 1.4;
     utter.volume = 1;
     window.speechSynthesis.speak(utter);
   }catch(e){ console.error('Speech failed', e); }
@@ -562,7 +563,7 @@ function startAlarm(){
   vibrate([300, 100, 300, 100, 300]);
   speakYouAreNext();
   alarmInterval = setInterval(beep, 1200);
-  speechInterval = setInterval(speakYouAreNext, 30000);
+  speechInterval = setInterval(speakYouAreNext, 5000);
   if('Notification' in window && Notification.permission === 'granted'){
     try{ new Notification("You're next — it's your turn to charge", { vibrate: [300, 100, 300, 100, 300] }); }catch(e){}
   }
