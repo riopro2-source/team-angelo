@@ -432,6 +432,11 @@
         <div class="stat-card"><div class="num" id="waitingCount">0</div><div class="lbl">Waiting now</div></div>
       </div>
 
+      <h3>Add driver manually</h3>
+      <p class="help-text">Insert someone into the queue yourself — useful for drivers without a phone or if something goes wrong with their sign-up.</p>
+      <input type="text" id="manualPlateInput" placeholder="Plate number, e.g. ABC 1234" style="text-transform:uppercase; margin-bottom:10px;" />
+      <button class="btn-amber btn-block" id="manualAddBtn" style="margin-bottom:20px;">Add to queue</button>
+
       <h3>Manage queue</h3>
       <div id="adminQueueRows"></div>
 
@@ -562,7 +567,7 @@ function startAlarm(){
   vibrate([300, 100, 300, 100, 300]);
   speakYouAreNext();
   alarmInterval = setInterval(beep, 1200);
-  speechInterval = setInterval(speakYouAreNext, 30000);
+  speechInterval = setInterval(speakYouAreNext, 5000);
   if('Notification' in window && Notification.permission === 'granted'){
     try{ new Notification("You're next — it's your turn to charge", { vibrate: [300, 100, 300, 100, 300] }); }catch(e){}
   }
@@ -588,19 +593,15 @@ function getDeviceId(){
 const myDeviceId = getDeviceId();
 
 function loadIdentity(){
-  try{
-    const raw = localStorage.getItem('cq_identity');
-    if(raw) myIdentity = JSON.parse(raw);
-  }catch(e){ myIdentity = null; }
+  // Intentionally not loaded from storage — plate number must be entered fresh every visit.
+  myIdentity = null;
 }
 
 function saveIdentity(name){
   myIdentity = { id: genId(), name: name };
-  localStorage.setItem('cq_identity', JSON.stringify(myIdentity));
 }
 
 function clearIdentity(){
-  localStorage.removeItem('cq_identity');
   myIdentity = null;
 }
 
@@ -653,8 +654,8 @@ function render(record){
   const queueCount = document.getElementById('queueCount');
 
   const current = queue.length > 0 ? queue[0] : null;
-  const myIndex = queue.findIndex(p => p.id === myIdentity.id);
-  const iAmCurrent = current && current.id === myIdentity.id;
+  const myIndex = queue.findIndex(p => p.deviceId === myDeviceId);
+  const iAmCurrent = current && current.deviceId === myDeviceId;
   const iHaveConfirmed = iAmCurrent && !!current.turnStartedAt;
 
   if(current){
@@ -694,7 +695,7 @@ function render(record){
     queueList.innerHTML = '<div class="empty-note">Nobody waiting behind the current charge.</div>';
   } else {
     queueList.innerHTML = rest.map((p, i) => {
-      const isMe = p.id === myIdentity.id;
+      const isMe = p.deviceId === myDeviceId;
       return `<div class="stub${isMe ? ' me' : ''}">
         <span class="stub-num">${i + 2}</span>
         <span class="stub-name">${escapeHtml(p.name)}</span>
@@ -721,7 +722,7 @@ let currentTurnAlertedAt = null;
 function updateCountdown(record){
   const el = document.getElementById('countdownText');
   const current = record.queue.length ? record.queue[0] : null;
-  const iAmCurrent = current && myIdentity && current.id === myIdentity.id;
+  const iAmCurrent = current && myIdentity && current.deviceId === myDeviceId;
   const needsConfirm = iAmCurrent && !current.turnStartedAt && current.turnAlertedAt;
 
   if(!needsConfirm){
@@ -814,7 +815,7 @@ async function joinQueue(){
   const record = await cloudRead();
   if(!record.plateOwners) record.plateOwners = {};
 
-  const alreadyInQueue = record.queue.find(p => p.id === myIdentity.id);
+  const alreadyInQueue = record.queue.find(p => p.deviceId === myDeviceId);
   if(alreadyInQueue) { await refresh(); return; }
 
   if(record.depotLat !== null && record.depotLng !== null){
@@ -873,7 +874,7 @@ function buildSessionEntry(person){
 
 async function markCharging(){
   const record = await cloudRead();
-  if(record.queue.length && record.queue[0].id === myIdentity.id && !record.queue[0].turnStartedAt){
+  if(record.queue.length && record.queue[0].deviceId === myDeviceId && !record.queue[0].turnStartedAt){
     record.queue[0].turnStartedAt = Date.now();
     await cloudWrite(record);
   }
@@ -886,7 +887,7 @@ async function markDone(){
   stopAlarm();
   notifiedThisTurn = false;
   const record = await cloudRead();
-  if(record.queue.length && record.queue[0].id === myIdentity.id){
+  if(record.queue.length && record.queue[0].deviceId === myDeviceId){
     record.history.push(buildSessionEntry(record.queue[0]));
     record.queue.shift();
     await cloudWrite(record);
@@ -896,8 +897,17 @@ async function markDone(){
 
 async function leaveQueue(){
   const record = await cloudRead();
-  record.queue = record.queue.filter(p => p.id !== myIdentity.id);
+  record.queue = record.queue.filter(p => p.deviceId !== myDeviceId);
   await cloudWrite(record);
+  await refresh();
+}
+
+async function adminConfirmCharging(){
+  const record = await cloudRead();
+  if(record.queue.length && !record.queue[0].turnStartedAt){
+    record.queue[0].turnStartedAt = Date.now();
+    await cloudWrite(record);
+  }
   await refresh();
 }
 
@@ -943,13 +953,17 @@ function renderAdminPanel(record){
   } else {
     rows.innerHTML = queue.map((p, i) => `
       <div class="admin-row">
-        <span><span class="plate">${escapeHtml(p.name)}</span> ${i === 0 ? '· charging now' : '· #' + (i+1) + ' waiting'}</span>
+        <span><span class="plate">${escapeHtml(p.name)}</span> ${i === 0 ? (p.turnStartedAt ? '· charging now' : '· up now, not confirmed') : '· #' + (i+1) + ' waiting'}</span>
         <span>
+          ${(i === 0 && !p.turnStartedAt) ? `<button class="mark-done" data-confirm="1">Confirm charging</button>` : ''}
           ${i === 0 ? `<button class="mark-done" data-done="${escapeHtml(p.id)}">Mark done</button>` : ''}
           <button data-remove="${escapeHtml(p.id)}">Remove</button>
         </span>
       </div>
     `).join('');
+    rows.querySelectorAll('[data-confirm]').forEach(btn => {
+      btn.addEventListener('click', adminConfirmCharging);
+    });
     rows.querySelectorAll('[data-remove]').forEach(btn => {
       btn.addEventListener('click', () => adminRemove(btn.getAttribute('data-remove')));
     });
@@ -989,15 +1003,11 @@ async function startMain(){
 
 async function init(){
   loadIdentity();
-  if(myIdentity && myIdentity.name){
-    await startMain();
-  } else {
-    document.getElementById('setupScreen').style.display = 'block';
-    document.getElementById('mainScreen').style.display = 'none';
-    document.getElementById('setupBanner').classList.toggle('show', !cloudReady());
-    const record = await cloudRead();
-    await renderQr(record.link);
-  }
+  document.getElementById('setupScreen').style.display = 'block';
+  document.getElementById('mainScreen').style.display = 'none';
+  document.getElementById('setupBanner').classList.toggle('show', !cloudReady());
+  const record = await cloudRead();
+  await renderQr(record.link);
 }
 
 document.getElementById('saveNameBtn').addEventListener('click', async () => {
@@ -1070,7 +1080,25 @@ document.getElementById('saveLinkBtn').addEventListener('click', async () => {
   window.alert('Queue link saved. The QR code now points to it.');
 });
 
+async function adminManualAdd(){
+  const input = document.getElementById('manualPlateInput');
+  const plate = input.value.trim().toUpperCase();
+  if(!plate){ window.alert('Enter a plate number first.'); return; }
+  const record = await cloudRead();
+  if(!record.plateOwners) record.plateOwners = {};
+  if(record.queue.find(p => p.name === plate)){
+    window.alert('That plate is already in the queue.');
+    return;
+  }
+  const syntheticDeviceId = 'admin_' + genId();
+  record.queue.push({ id: genId(), name: plate, deviceId: syntheticDeviceId, joinedAt: Date.now(), addedByAdmin: true });
+  await cloudWrite(record);
+  input.value = '';
+  await refresh();
+}
+
 document.getElementById('resetQueueBtn').addEventListener('click', adminResetQueue);
+document.getElementById('manualAddBtn').addEventListener('click', adminManualAdd);
 
 function updateDepotStatusText(record){
   const el = document.getElementById('depotStatusText');
